@@ -152,7 +152,16 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.commitIndex {
+		return
+	}
+	rf.log = rf.log[index:]
+	rf.commitIndex = index
+	rf.lastApplied = index
+	rf.persist()
+	
 }
 
 
@@ -291,18 +300,120 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here (2A)
 		// Check if a leader election should be started.
-
-
+		select {
+			case <- time.After(rf.electionTimeout):
+				rf.mu.Lock()
+				rf.state = Candidate
+				rf.currentTerm += 1
+				rf.votedFor = rf.me
+				rf.persist()
+				rf.mu.Unlock()
+				rf.startElection()
+				rf.electionTimeout = time.Duration(300 + rand.Int63n(300)) * time.Millisecond
+			case <- time.After(rf.heartbeatTimeout):
+				rf.mu.Lock()
+				if rf.state == Leader {
+					rf.broadcastAppendEntries()
+					rf.heartbeatTimeout = time.Duration(100) * time.Millisecond
+				}
+				rf.mu.Unlock()
+		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// ms := 50 + (rand.Int63() % 300)
+		// time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {}
+
+func(rf *Raft) broadcastAppendEntries() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go rf.replicator(i)
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	request := RequestVoteArgs{}
+	request.term = rf.currentTerm
+	request.candidateId = rf.me
+	request.lastLogIndex = len(rf.log) - 1
+	request.lastLogTerm = rf.log[request.lastLogIndex].Term
+	DPrintf("Node %d start election for term %d", rf.me, rf.currentTerm)
+	granted := 1
+	rf.votedFor = rf.me
+	rf.persist()
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(i int) {
+				var reply RequestVoteReply
+				if rf.sendRequestVote(i, &request, &reply) {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.voteGranted {
+						granted += 1
+						if granted > len(rf.peers) / 2 {
+							rf.state = Leader
+							rf.broadcastAppendEntries()
+						}
+					} else {
+						if reply.currentTerm > rf.currentTerm {
+							rf.currentTerm = reply.currentTerm
+							rf.state = Follower
+							rf.votedFor = -1
+							rf.persist()
+						}
+					}
+				}
+			}(i)
+		}
+	}
+}
+ 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	defer DPrintf("Node %d receive AppendEntries from %d", rf.me, args.leaderId)
+	if args.term < rf.currentTerm {
+		reply.term = rf.currentTerm
+		reply.success = false
+		return
+	}
+	if args.term >= rf.currentTerm {
+		rf.currentTerm = args.term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.persist()
+	}
+	if args.prevLogIndex > len(rf.log) - 1 {
+		reply.term = rf.currentTerm
+		reply.success = false
+		reply.conflictIndex = len(rf.log)
+		DPrintf("Node %d reject AppendEntries from %d", rf.me, args.leaderId)
+		return
+	}
+	if args.prevLogIndex >= 0 && rf.log[args.prevLogIndex].Term != args.prevLogTerm {
+		reply.term = rf.currentTerm
+		reply.success = false
+		reply.conflictIndex = args.prevLogIndex
+		DPrintf("Node %d reject AppendEntries from %d", rf.me, args.leaderId)
+		return
+	}
+	if args.prevLogIndex >= 0 && rf.log[args.prevLogIndex].Term == args.prevLogTerm {
+		rf.log = rf.log[:args.prevLogIndex + 1]
+		rf.log = append(rf.log, args.entries...)
+		reply.term = rf.currentTerm
+		reply.success = true
+		DPrintf("Node %d accept AppendEntries from %d", rf.me, args.leaderId)
+	}
+	if args.leaderCommit > rf.commitIndex {
+		rf.commitIndex = args.leaderCommit
+	}
+	rf.applyCond.Signal()
+}
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
