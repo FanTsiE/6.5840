@@ -53,6 +53,7 @@ type ApplyMsg struct {
 type Entry struct {
     Command interface{}
     Term    int
+	Index  	int
 }
 
 type NodeState int
@@ -161,7 +162,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.commitIndex = index
 	rf.lastApplied = index
 	rf.persist()
-	
+
 }
 
 
@@ -203,6 +204,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
+	defer DPrintf("Node %d receive RequestVote from %d", rf.me, args.candidateId)
 	var term = args.term
 	var candidateId = args.candidateId
 	if term < rf.currentTerm {
@@ -274,7 +276,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		isLeader = false
+	}
+	if rf.state == Leader {
+		entry := Entry{command, rf.currentTerm, len(rf.log)}
+		rf.log = append(rf.log, entry)
+		index = len(rf.log) - 1
+		term = rf.currentTerm
+		rf.persist()
+	}
 
 	return index, term, isLeader
 }
@@ -322,8 +335,8 @@ func (rf *Raft) ticker() {
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		// ms := 50 + (rand.Int63() % 300)
-		// time.Sleep(time.Duration(ms) * time.Millisecond)
+		 ms := 50 + (rand.Int63() % 300)
+		 time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -420,6 +433,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) getLastLog() Entry {
+	if len(rf.log) == 0 {
+		return Entry{nil, 0, 0}
+	}
+	return rf.log[len(rf.log) - 1]
+}
+
 
 func (rf *Raft) replicator(server int) {
 	for rf.killed() == false {
@@ -504,12 +524,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimeout = time.Duration(100) * time.Millisecond
 	// Your initialization code here (2A, 2B, 2C).
 	rf.readPersist(persister.ReadRaftState())
-	lastLog := rf.log[len(rf.log) - 1]
+	lastLog := rf.getLastLog()
 	for i := 0; i < len(peers); i++ {
 		rf.matchIndex[i] = 0
-		rf.nextIndex[i] = lastLog.Term + 1
+		rf.nextIndex[i] = lastLog.Index + 1
 		if i != me {
-			rf.repliCond[i] = sync.NewCond(&rf.mu)
+			rf.repliCond[i] = sync.NewCond(&sync.Mutex{})
 			go rf.replicator(i)
 		}
 	}
